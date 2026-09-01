@@ -408,6 +408,7 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
       }
     }
   }
+  if (!downloadedAny) throw new Error("youtube_audio_unavailable");
   if (lastError) throw lastError;
   throw new Error("youtube_transcription_failed");
 }
