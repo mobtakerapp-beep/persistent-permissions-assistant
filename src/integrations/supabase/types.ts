@@ -228,6 +228,10 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      bootstrap_account: {
+        Args: { _school?: string; _teacher_name?: string; _user_id: string }
+        Returns: undefined
+      }
       ensure_fixed_admin: { Args: { _user_id: string }; Returns: undefined }
       fixed_admin_email: { Args: never; Returns: string }
       has_role: {
