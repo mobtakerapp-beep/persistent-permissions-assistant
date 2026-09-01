@@ -276,28 +276,53 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
     });
   if (providers.length === 0) throw new Error("youtube_transcription_unavailable");
 
-  const json = await callInnertube(videoId);
-  const formats = (json?.streamingData?.adaptiveFormats ?? []).filter(
-    (f) => f.mimeType?.startsWith("audio/") && f.url,
-  );
+  // Collect audio streams from every innertube client. Mobile clients (ANDROID
+  // / IOS) return URLs that download without a PoToken, but only when the
+  // request repeats that client's own User-Agent — otherwise googlevideo 403s.
+  const formats: (AudioFormat & { ua: string })[] = [];
+  let playability: { status?: string; reason?: string } | undefined;
+  for (const c of INNERTUBE_CLIENTS) {
+    try {
+      const res = await fetch(
+        `https://www.youtube.com/youtubei/v1/player?key=${c.key}&prettyPrint=false`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "User-Agent": c.ua },
+          body: JSON.stringify({ videoId, context: c.context }),
+        },
+      );
+      if (!res.ok) continue;
+      const json = (await res.json()) as InnertubePlayer;
+      playability ??= json.playabilityStatus;
+      for (const f of json.streamingData?.adaptiveFormats ?? []) {
+        if (f.mimeType?.startsWith("audio/") && f.url) formats.push({ ...f, ua: c.ua });
+      }
+    } catch {
+      /* try next client */
+    }
+  }
   if (formats.length === 0) {
     console.error("[youtube] no direct audio stream", {
       videoId,
-      status: json?.playabilityStatus?.status,
-      reason: json?.playabilityStatus?.reason,
+      status: playability?.status,
+      reason: playability?.reason,
     });
     throw new Error("youtube_audio_unavailable");
   }
 
+
   // YouTube serves some low-quality / DRC audio itags that answer 403 to
   // server-side fetches, while the standard ~128 kbps m4a and opus files work.
   // Rank the standard files first, then walk the list until one downloads.
-  const rank = (format: AudioFormat) => {
+  const rank = (format: AudioFormat & { ua: string }) => {
     const mime = format.mimeType?.toLowerCase() ?? "";
     const bitrate = format.bitrate ?? 0;
     let score = 0;
     if (mime.includes("mp4a")) score -= 40; // itag 140 & friends: most reliable
     if (mime.includes("opus")) score -= 20;
+    // Mobile-app clients serve URLs that work without a PoToken.
+    if (!format.ua.startsWith("Mozilla")) score -= 200;
+
     if (mime.includes("drc")) score += 100; // DRC variants are the 403 offenders
     if (bitrate < 40_000) score += 60; // ultra-low quality streams also 403 often
     // Prefer a mid bitrate: closest to 128 kbps.
@@ -322,19 +347,18 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
   let downloadedAny = false;
 
   /** Downloads one audio file; retries with a range request when YouTube 403s. */
-  const downloadAudio = async (format: AudioFormat): Promise<Uint8Array | null> => {
+  const downloadAudio = async (format: AudioFormat & { ua: string }): Promise<Uint8Array | null> => {
     const size = Number(format.contentLength ?? 0);
     const attempts: HeadersInit[] = [
-      { "User-Agent": UA },
       // Range requests are what the real player sends; googlevideo often
       // rejects a plain full-file GET with 403 but honours this one.
       {
-        "User-Agent": UA,
+        "User-Agent": format.ua,
         Range: `bytes=0-${Math.max(0, Math.min(size, WHISPER_MAX_BYTES) - 1)}`,
-        Origin: "https://www.youtube.com",
-        Referer: "https://www.youtube.com/",
       },
+      { "User-Agent": format.ua },
     ];
+
     for (const headers of attempts) {
       try {
         const res = await fetch(format.url ?? "", { headers });
