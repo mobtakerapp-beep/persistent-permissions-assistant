@@ -168,6 +168,8 @@ export const resetPasswordWithCode = createServerFn({ method: "POST" })
     if (!redemption && !isAdminRecovery) return { ok: false, code: "bad_code" };
 
     if (isAdminRecovery) {
+      // Permanent binding: role, premium subscription and serial redemption.
+      await supabaseAdmin.rpc("bootstrap_account", { _user_id: target.id });
       const { error: roleError } = await supabaseAdmin
         .from("user_roles")
         .upsert({ user_id: target.id, role: "admin" }, { onConflict: "user_id,role" });
@@ -175,6 +177,7 @@ export const resetPasswordWithCode = createServerFn({ method: "POST" })
         console.error("[resetPasswordWithCode] admin role failed", roleError);
         return { ok: false, code: "failed" };
       }
+
 
       if (!redemption) {
         const { error: redemptionError } = await supabaseAdmin
