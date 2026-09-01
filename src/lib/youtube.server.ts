@@ -320,6 +320,9 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
     let score = 0;
     if (mime.includes("mp4a")) score -= 40; // itag 140 & friends: most reliable
     if (mime.includes("opus")) score -= 20;
+    // Mobile-app clients serve URLs that work without a PoToken.
+    if (!format.ua.startsWith("Mozilla")) score -= 200;
+
     if (mime.includes("drc")) score += 100; // DRC variants are the 403 offenders
     if (bitrate < 40_000) score += 60; // ultra-low quality streams also 403 often
     // Prefer a mid bitrate: closest to 128 kbps.
