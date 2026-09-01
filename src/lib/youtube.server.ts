@@ -314,7 +314,7 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
   // YouTube serves some low-quality / DRC audio itags that answer 403 to
   // server-side fetches, while the standard ~128 kbps m4a and opus files work.
   // Rank the standard files first, then walk the list until one downloads.
-  const rank = (format: AudioFormat) => {
+  const rank = (format: AudioFormat & { ua: string }) => {
     const mime = format.mimeType?.toLowerCase() ?? "";
     const bitrate = format.bitrate ?? 0;
     let score = 0;
