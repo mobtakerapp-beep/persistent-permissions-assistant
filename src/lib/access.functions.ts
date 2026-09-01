@@ -150,7 +150,7 @@ export const redeemCode = createServerFn({ method: "POST" })
 export const adminListCodes = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }): Promise<CodeRow[]> => {
-    await assertAdmin(context.userId, getClaimEmail(context.claims));
+    await assertAdmin(context.userId, getClaimEmail(context.claims), context.supabase);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data } = await supabaseAdmin
       .from("activation_codes")
@@ -185,7 +185,7 @@ export const adminCreateCodes = createServerFn({ method: "POST" })
       .parse(input),
   )
   .handler(async ({ data, context }) => {
-    await assertAdmin(context.userId, getClaimEmail(context.claims));
+    await assertAdmin(context.userId, getClaimEmail(context.claims), context.supabase);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     const gen = () => {
@@ -225,7 +225,7 @@ export type RedemptionRow = {
 export const adminListRedemptions = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }): Promise<RedemptionRow[]> => {
-    await assertAdmin(context.userId, getClaimEmail(context.claims));
+    await assertAdmin(context.userId, getClaimEmail(context.claims), context.supabase);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
     const { data: redemptions } = await supabaseAdmin
@@ -278,7 +278,7 @@ export const adminSetCodeActive = createServerFn({ method: "POST" })
     z.object({ id: z.string().uuid(), active: z.boolean() }).parse(input),
   )
   .handler(async ({ data, context }) => {
-    await assertAdmin(context.userId, getClaimEmail(context.claims));
+    await assertAdmin(context.userId, getClaimEmail(context.claims), context.supabase);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     await supabaseAdmin.from("activation_codes").update({ active: data.active }).eq("id", data.id);
     return { ok: true };
