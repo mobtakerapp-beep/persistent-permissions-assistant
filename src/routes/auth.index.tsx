@@ -59,14 +59,31 @@ function AuthPage() {
     });
   }, [navigate]);
 
+  // Owner email + serial come from the cloud, so they survive every page
+  // change and are never lost with local state.
+  useEffect(() => {
+    let alive = true;
+    ownerCreds()
+      .then((creds) => {
+        if (!alive) return;
+        setOwner(creds);
+        setEmail((current) => current || localStorage.getItem("remembered_email") || creds.email);
+        setResetCode((current) => current || creds.serial);
+      })
+      .catch(() => {
+        /* keep the built-in defaults */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [ownerCreds]);
+
   // Remembered email (saved locally on the device).
   useEffect(() => {
     const saved = localStorage.getItem("remembered_email");
     if (saved) {
       setEmail(saved);
       setRemember(true);
-    } else {
-      setRemember(false);
     }
   }, []);
 
@@ -78,11 +95,12 @@ function AuthPage() {
   const toggleReset = () => {
     const opening = !showReset;
     setShowReset(opening);
-    if (opening && (!email.trim() || email.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase())) {
-      setEmail(ADMIN_EMAIL);
-      setResetCode(ADMIN_RECOVERY_CODE);
+    if (opening && (!email.trim() || email.trim().toLowerCase() === owner.email.toLowerCase())) {
+      setEmail(owner.email);
+      setResetCode(owner.serial);
     }
   };
+
 
   const resetWithCode = async (e: React.FormEvent) => {
     e.preventDefault();
