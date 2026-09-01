@@ -66,10 +66,10 @@ export async function listRedemptionsClient(): Promise<RedemptionRow[]> {
     for (const s of subs ?? []) expiryById.set(s.user_id, s.expires_at);
     const { data: profiles } = await supabase
       .from("profiles")
-      .select("id, email")
+      .select("id, teacher_name")
       .in("id", userIds);
-    for (const p of (profiles ?? []) as { id: string; email?: string | null }[]) {
-      emailById.set(p.id, p.email ?? null);
+    for (const p of profiles ?? []) {
+      emailById.set(p.id, p.teacher_name || null);
     }
   }
 
