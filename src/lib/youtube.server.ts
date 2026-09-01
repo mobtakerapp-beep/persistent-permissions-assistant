@@ -373,6 +373,10 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
             bitrate: format.bitrate,
             range: `${downloaded}-${end}`,
           });
+          // Some signed URLs allow only the initial range. A prefix still
+          // contains enough speech for lesson generation and is preferable to
+          // failing the entire request with youtube_audio_unavailable.
+          if (downloaded >= chunkSize) break;
           return null;
         }
         const chunk = new Uint8Array(await res.arrayBuffer());
