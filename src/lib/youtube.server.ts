@@ -345,41 +345,59 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
   /** Downloads one audio file, trying every request style YouTube accepts. */
   const downloadAudio = async (format: AudioFormat & { ua: string }): Promise<Uint8Array | null> => {
     const size = Number(format.contentLength ?? 0);
-    const cap = Math.max(0, (size > 0 ? Math.min(size, WHISPER_MAX_BYTES) : WHISPER_MAX_BYTES) - 1);
     const baseUrl = format.url ?? "";
     if (!baseUrl) return null;
-    const sep = baseUrl.includes("?") ? "&" : "?";
-    // Several alternative download shapes: Range header, googlevideo's own
-    // ?range= query parameter, plain GET, and a desktop-browser UA retry.
-    const attempts: { url: string; headers: HeadersInit }[] = [
-      { url: baseUrl, headers: { "User-Agent": format.ua, Range: `bytes=0-${cap}` } },
-      { url: `${baseUrl}${sep}range=0-${cap}`, headers: { "User-Agent": format.ua } },
-      { url: baseUrl, headers: { "User-Agent": format.ua } },
-      { url: baseUrl, headers: { "User-Agent": UA, Range: `bytes=0-${cap}` } },
-      { url: `${baseUrl}${sep}range=0-${cap}`, headers: { "User-Agent": UA } },
-    ];
 
-    for (const attempt of attempts) {
+    // googlevideo rejects large single range requests (usually with 403), even
+    // when the exact same signed URL accepts smaller ranges. Download in 1 MiB
+    // pieces and join them so the transcription provider receives a complete,
+    // valid audio container instead of one oversized rejected request.
+    const targetSize = size > 0 ? Math.min(size, WHISPER_MAX_BYTES) : WHISPER_MAX_BYTES;
+    const chunkSize = 1024 * 1024;
+    const chunks: Uint8Array[] = [];
+    let downloaded = 0;
+    while (downloaded < targetSize) {
+      const end = Math.min(downloaded + chunkSize, targetSize) - 1;
       try {
-        const res = await fetch(attempt.url, { headers: attempt.headers });
+        const res = await fetch(baseUrl, {
+          headers: {
+            "User-Agent": format.ua,
+            Range: `bytes=${downloaded}-${end}`,
+          },
+        });
         if (!res.ok) {
           console.error("[youtube] audio download rejected", {
             videoId,
             status: res.status,
             mimeType: format.mimeType,
             bitrate: format.bitrate,
+            range: `${downloaded}-${end}`,
           });
-          continue; // any failure: just try the next request style
+          // Some signed URLs allow only the initial range. A prefix still
+          // contains enough speech for lesson generation and is preferable to
+          // failing the entire request with youtube_audio_unavailable.
+          if (downloaded >= chunkSize) break;
+          return null;
         }
-        let bytes = new Uint8Array(await res.arrayBuffer());
-        if (bytes.length > WHISPER_MAX_BYTES) bytes = bytes.slice(0, WHISPER_MAX_BYTES);
-        if (bytes.length < 1024) continue;
-        return bytes;
+        const chunk = new Uint8Array(await res.arrayBuffer());
+        if (chunk.length === 0) return null;
+        chunks.push(chunk);
+        downloaded += chunk.length;
+        if (chunk.length < end - downloaded + chunk.length + 1) break;
       } catch (error) {
         console.error("[youtube] audio download failed", error);
+        return null;
       }
     }
-    return null;
+
+    if (downloaded < 1024) return null;
+    const audio = new Uint8Array(downloaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+      audio.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return audio;
   };
 
   for (const format of candidates) {
