@@ -289,6 +289,22 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
     throw new Error("youtube_audio_unavailable");
   }
 
+  // YouTube serves some low-quality / DRC audio itags that answer 403 to
+  // server-side fetches, while the standard ~128 kbps m4a and opus files work.
+  // Rank the standard files first, then walk the list until one downloads.
+  const rank = (format: AudioFormat) => {
+    const mime = format.mimeType?.toLowerCase() ?? "";
+    const bitrate = format.bitrate ?? 0;
+    let score = 0;
+    if (mime.includes("mp4a")) score -= 40; // itag 140 & friends: most reliable
+    if (mime.includes("opus")) score -= 20;
+    if (mime.includes("drc")) score += 100; // DRC variants are the 403 offenders
+    if (bitrate < 40_000) score += 60; // ultra-low quality streams also 403 often
+    // Prefer a mid bitrate: closest to 128 kbps.
+    score += Math.abs(bitrate - 128_000) / 100_000;
+    return score;
+  };
+
   // A truncated compressed container is frequently rejected as corrupt. Only
   // upload complete audio files that fit the transcription endpoint limit.
   const completeFormats = formats
@@ -296,24 +312,61 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
       const size = Number(format.contentLength ?? 0);
       return Number.isFinite(size) && size > 0 && size <= WHISPER_MAX_BYTES;
     })
-    .sort((a, b) => (a.bitrate ?? Infinity) - (b.bitrate ?? Infinity));
+    .sort((a, b) => rank(a) - rank(b));
   if (completeFormats.length === 0) {
     console.error("[youtube] audio exceeds transcription limit", { videoId });
     throw new Error("youtube_audio_too_large");
   }
 
   let lastError: Error | null = null;
+  let downloadedAny = false;
 
-  for (const format of completeFormats.slice(0, 4)) {
-    let audio: Uint8Array;
-    try {
-      const res = await fetch(format.url ?? "", { headers: { "User-Agent": UA } });
-      if (!res.ok) continue;
-      audio = new Uint8Array(await res.arrayBuffer());
-      if (audio.length < 1024 || audio.length > WHISPER_MAX_BYTES) continue;
-    } catch {
+  /** Downloads one audio file; retries with a range request when YouTube 403s. */
+  const downloadAudio = async (format: AudioFormat): Promise<Uint8Array | null> => {
+    const size = Number(format.contentLength ?? 0);
+    const attempts: HeadersInit[] = [
+      { "User-Agent": UA },
+      // Range requests are what the real player sends; googlevideo often
+      // rejects a plain full-file GET with 403 but honours this one.
+      {
+        "User-Agent": UA,
+        Range: `bytes=0-${Math.max(0, Math.min(size, WHISPER_MAX_BYTES) - 1)}`,
+        Origin: "https://www.youtube.com",
+        Referer: "https://www.youtube.com/",
+      },
+    ];
+    for (const headers of attempts) {
+      try {
+        const res = await fetch(format.url ?? "", { headers });
+        if (!res.ok) {
+          console.error("[youtube] audio download rejected", {
+            videoId,
+            status: res.status,
+            mimeType: format.mimeType,
+            bitrate: format.bitrate,
+          });
+          if (res.status === 403 || res.status === 429) continue;
+          return null;
+        }
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        if (bytes.length < 1024 || bytes.length > WHISPER_MAX_BYTES) return null;
+        return bytes;
+      } catch (error) {
+        console.error("[youtube] audio download failed", error);
+      }
+    }
+    return null;
+  };
+
+  for (const format of completeFormats.slice(0, 6)) {
+    const audio = await downloadAudio(format);
+    if (!audio) {
+      lastError ??= new Error("youtube_audio_unavailable");
       continue;
     }
+    downloadedAny = true;
+    if (!downloadedAny) continue;
+
 
     for (const p of providers) {
       try {
