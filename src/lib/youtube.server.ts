@@ -276,18 +276,40 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
     });
   if (providers.length === 0) throw new Error("youtube_transcription_unavailable");
 
-  const json = await callInnertube(videoId);
-  const formats = (json?.streamingData?.adaptiveFormats ?? []).filter(
-    (f) => f.mimeType?.startsWith("audio/") && f.url,
-  );
+  // Collect audio streams from every innertube client. Mobile clients (ANDROID
+  // / IOS) return URLs that download without a PoToken, but only when the
+  // request repeats that client's own User-Agent — otherwise googlevideo 403s.
+  const formats: (AudioFormat & { ua: string })[] = [];
+  let playability: { status?: string; reason?: string } | undefined;
+  for (const c of INNERTUBE_CLIENTS) {
+    try {
+      const res = await fetch(
+        `https://www.youtube.com/youtubei/v1/player?key=${c.key}&prettyPrint=false`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "User-Agent": c.ua },
+          body: JSON.stringify({ videoId, context: c.context }),
+        },
+      );
+      if (!res.ok) continue;
+      const json = (await res.json()) as InnertubePlayer;
+      playability ??= json.playabilityStatus;
+      for (const f of json.streamingData?.adaptiveFormats ?? []) {
+        if (f.mimeType?.startsWith("audio/") && f.url) formats.push({ ...f, ua: c.ua });
+      }
+    } catch {
+      /* try next client */
+    }
+  }
   if (formats.length === 0) {
     console.error("[youtube] no direct audio stream", {
       videoId,
-      status: json?.playabilityStatus?.status,
-      reason: json?.playabilityStatus?.reason,
+      status: playability?.status,
+      reason: playability?.reason,
     });
     throw new Error("youtube_audio_unavailable");
   }
+
 
   // YouTube serves some low-quality / DRC audio itags that answer 403 to
   // server-side fetches, while the standard ~128 kbps m4a and opus files work.
