@@ -1,0 +1,499 @@
+/**
+ * Server-only helpers to pull a transcript from a YouTube video.
+ * Throws: youtube_invalid_url, youtube_no_captions, openai_quota, openai_invalid_key.
+ */
+
+import { parseYoutubeId } from "./youtube-url";
+
+export { parseYoutubeId };
+
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+function decodeEntities(s: string) {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&#39;/g, "'")
+    .replace(/&#34;|&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, d: string) => String.fromCharCode(Number(d)));
+}
+
+type CaptionTrack = {
+  baseUrl: string;
+  languageCode?: string;
+  kind?: string;
+  name?: { simpleText?: string };
+};
+
+type AudioFormat = {
+  mimeType?: string;
+  bitrate?: number;
+  contentLength?: string;
+  url?: string;
+};
+
+type InnertubePlayer = {
+  playabilityStatus?: { status?: string; reason?: string };
+  videoDetails?: { title?: string; lengthSeconds?: string };
+  captions?: {
+    playerCaptionsTracklistRenderer?: { captionTracks?: CaptionTrack[] };
+  };
+  streamingData?: {
+    adaptiveFormats?: AudioFormat[];
+  };
+};
+
+function extractJson<T>(html: string, key: string): T | null {
+  const idx = html.indexOf(key);
+  if (idx === -1) return null;
+  // find the start of the value (array or object) after the key
+  let i = html.indexOf(":", idx + key.length);
+  if (i === -1) return null;
+  i += 1;
+  while (i < html.length && /\s/.test(html[i]!)) i++;
+  const open = html[i];
+  if (open !== "[" && open !== "{") return null;
+  const close = open === "[" ? "]" : "}";
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let j = i; j < html.length; j++) {
+    const ch = html[j]!;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === open) depth++;
+    else if (ch === close) {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(html.slice(i, j + 1)) as T;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function parseCaptionXml(xml: string): string {
+  // YouTube serves either srv1 (<text>) or srv3 (<p>/<s>) markup.
+  const nodes = [
+    ...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g),
+    ...xml.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/g),
+  ];
+  return nodes
+    .map((m) => decodeEntities((m[1] ?? "").replace(/<[^>]+>/g, "")))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function fetchTrackText(baseUrl: string): Promise<string> {
+  // Strip any existing fmt so our own format request wins.
+  const url = baseUrl.replace(/&amp;/g, "&").replace(/([?&])fmt=[^&]*/g, "$1");
+
+  const sep = url.includes("?") ? "&" : "?";
+  const res = await fetch(`${url}${sep}fmt=json3`, { headers: { "User-Agent": UA } });
+  if (res.ok) {
+    const body = await res.text();
+    try {
+      const json = JSON.parse(body) as {
+        events?: { segs?: { utf8?: string }[] }[];
+      };
+      const text = (json.events ?? [])
+        .flatMap((e) => (e.segs ?? []).map((s) => s.utf8 ?? ""))
+        .join("")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (text) return text;
+    } catch {
+      // Not JSON — YouTube returned XML instead; parse it directly.
+      const text = parseCaptionXml(body);
+      if (text) return text;
+    }
+  }
+  const xmlRes = await fetch(url, { headers: { "User-Agent": UA } });
+  if (!xmlRes.ok) return "";
+  return parseCaptionXml(await xmlRes.text());
+
+}
+
+const INNERTUBE_CLIENTS = [
+  {
+    key: "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+    context: {
+      client: {
+        clientName: "WEB_EMBEDDED_PLAYER",
+        clientVersion: "1.20250826.00.00",
+        clientScreen: "EMBED",
+        hl: "en",
+      },
+      thirdParty: { embedUrl: "https://www.youtube.com/" },
+    },
+    ua: UA,
+  },
+  {
+    key: "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+    context: {
+      client: {
+        clientName: "ANDROID",
+        clientVersion: "20.10.38",
+        androidSdkVersion: 35,
+        hl: "en",
+      },
+    },
+    ua: "com.google.android.youtube/20.10.38 (Linux; U; Android 15) gzip",
+  },
+  {
+    key: "AIzaSyB-8OLtTu4pDhQ2bK7ClB6KB_xVvM7X0xY",
+    context: {
+      client: {
+        clientName: "IOS",
+        clientVersion: "20.10.4",
+        deviceModel: "iPhone16,2",
+        hl: "en",
+      },
+    },
+    ua: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)",
+  },
+] as const;
+
+async function callInnertube(videoId: string) {
+  let bestResponse: InnertubePlayer | null = null;
+  for (const c of INNERTUBE_CLIENTS) {
+    try {
+      const res = await fetch(
+        `https://www.youtube.com/youtubei/v1/player?key=${c.key}&prettyPrint=false`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "User-Agent": c.ua },
+          body: JSON.stringify({ videoId, context: c.context }),
+        },
+      );
+      if (!res.ok) continue;
+      const json = (await res.json()) as InnertubePlayer;
+      if (!bestResponse) bestResponse = json;
+      const hasCaptions = Boolean(
+        json.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length,
+      );
+      const hasDirectAudio = Boolean(
+        json.streamingData?.adaptiveFormats?.some(
+          (format) => format.mimeType?.startsWith("audio/") && format.url,
+        ),
+      );
+      if (hasCaptions || hasDirectAudio) return json;
+    } catch {
+      /* try next client */
+    }
+  }
+  return bestResponse;
+}
+
+/** Ask YouTube's internal player API for caption tracks (works when the watch HTML has none). */
+async function fetchInnertube(
+  videoId: string,
+): Promise<{ title: string; tracks: CaptionTrack[] } | null> {
+  const json = await callInnertube(videoId);
+  if (!json) return null;
+  const tracks =
+    json.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+  if (tracks.length === 0) return null;
+  return { title: json.videoDetails?.title ?? "", tracks };
+}
+
+// OpenAI transcription upload limit is 25MB.
+const WHISPER_MAX_BYTES = 24 * 1024 * 1024;
+
+function audioFileDetails(mimeType: string | undefined) {
+  const normalized = mimeType?.split(";", 1)[0]?.trim().toLowerCase();
+  if (normalized === "audio/webm") return { mime: "audio/webm", name: "youtube-audio.webm" };
+  if (normalized === "audio/mpeg") return { mime: "audio/mpeg", name: "youtube-audio.mp3" };
+  if (normalized === "audio/wav") return { mime: "audio/wav", name: "youtube-audio.wav" };
+  return { mime: "audio/mp4", name: "youtube-audio.m4a" };
+}
+
+async function readTranscriptionResponse(response: Response): Promise<string> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/event-stream")) {
+    const body = await response.text();
+    try {
+      const result = JSON.parse(body) as { text?: string };
+      return result.text?.trim() ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  const body = await response.text();
+  let finalText = "";
+  let streamedText = "";
+  for (const line of body.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const event = JSON.parse(payload) as { type?: string; delta?: string; text?: string };
+      if (event.type === "transcript.text.delta" && event.delta) streamedText += event.delta;
+      if (event.type === "transcript.text.done" && event.text) finalText = event.text;
+    } catch {
+      // Ignore keep-alive or provider-specific SSE lines.
+    }
+  }
+  return (finalText || streamedText).trim();
+}
+
+/**
+ * Caption-free fallback: download the video's audio track directly from
+ * YouTube's streaming data and transcribe it with OpenAI. Pure fetch, so it
+ * runs in the edge runtime (no yt-dlp / child_process).
+ */
+export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): Promise<string> {
+  const lovableKey = process.env["LOVABLE_API_KEY"];
+  // Prefer Lovable AI (no extra key / quota needed); fall back to OpenAI directly.
+  const providers: { url: string; key: string; model: string; openai: boolean }[] = [];
+  if (lovableKey)
+    providers.push({
+      url: "https://ai.gateway.lovable.dev/v1/audio/transcriptions",
+      key: lovableKey,
+      model: "openai/gpt-4o-transcribe",
+      openai: false,
+    });
+  if (apiKey)
+    providers.push({
+      url: "https://api.openai.com/v1/audio/transcriptions",
+      key: apiKey,
+      model: "gpt-4o-mini-transcribe",
+      openai: true,
+    });
+  if (providers.length === 0) throw new Error("youtube_transcription_unavailable");
+
+  const json = await callInnertube(videoId);
+  const formats = (json?.streamingData?.adaptiveFormats ?? []).filter(
+    (f) => f.mimeType?.startsWith("audio/") && f.url,
+  );
+  if (formats.length === 0) {
+    console.error("[youtube] no direct audio stream", {
+      videoId,
+      status: json?.playabilityStatus?.status,
+      reason: json?.playabilityStatus?.reason,
+    });
+    throw new Error("youtube_audio_unavailable");
+  }
+
+  // YouTube serves some low-quality / DRC audio itags that answer 403 to
+  // server-side fetches, while the standard ~128 kbps m4a and opus files work.
+  // Rank the standard files first, then walk the list until one downloads.
+  const rank = (format: AudioFormat) => {
+    const mime = format.mimeType?.toLowerCase() ?? "";
+    const bitrate = format.bitrate ?? 0;
+    let score = 0;
+    if (mime.includes("mp4a")) score -= 40; // itag 140 & friends: most reliable
+    if (mime.includes("opus")) score -= 20;
+    if (mime.includes("drc")) score += 100; // DRC variants are the 403 offenders
+    if (bitrate < 40_000) score += 60; // ultra-low quality streams also 403 often
+    // Prefer a mid bitrate: closest to 128 kbps.
+    score += Math.abs(bitrate - 128_000) / 100_000;
+    return score;
+  };
+
+  // A truncated compressed container is frequently rejected as corrupt. Only
+  // upload complete audio files that fit the transcription endpoint limit.
+  const completeFormats = formats
+    .filter((format) => {
+      const size = Number(format.contentLength ?? 0);
+      return Number.isFinite(size) && size > 0 && size <= WHISPER_MAX_BYTES;
+    })
+    .sort((a, b) => rank(a) - rank(b));
+  if (completeFormats.length === 0) {
+    console.error("[youtube] audio exceeds transcription limit", { videoId });
+    throw new Error("youtube_audio_too_large");
+  }
+
+  let lastError: Error | null = null;
+  let downloadedAny = false;
+
+  /** Downloads one audio file; retries with a range request when YouTube 403s. */
+  const downloadAudio = async (format: AudioFormat): Promise<Uint8Array | null> => {
+    const size = Number(format.contentLength ?? 0);
+    const attempts: HeadersInit[] = [
+      { "User-Agent": UA },
+      // Range requests are what the real player sends; googlevideo often
+      // rejects a plain full-file GET with 403 but honours this one.
+      {
+        "User-Agent": UA,
+        Range: `bytes=0-${Math.max(0, Math.min(size, WHISPER_MAX_BYTES) - 1)}`,
+        Origin: "https://www.youtube.com",
+        Referer: "https://www.youtube.com/",
+      },
+    ];
+    for (const headers of attempts) {
+      try {
+        const res = await fetch(format.url ?? "", { headers });
+        if (!res.ok) {
+          console.error("[youtube] audio download rejected", {
+            videoId,
+            status: res.status,
+            mimeType: format.mimeType,
+            bitrate: format.bitrate,
+          });
+          if (res.status === 403 || res.status === 429) continue;
+          return null;
+        }
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        if (bytes.length < 1024 || bytes.length > WHISPER_MAX_BYTES) return null;
+        return bytes;
+      } catch (error) {
+        console.error("[youtube] audio download failed", error);
+      }
+    }
+    return null;
+  };
+
+  for (const format of completeFormats.slice(0, 6)) {
+    const audio = await downloadAudio(format);
+    if (!audio) {
+      lastError ??= new Error("youtube_audio_unavailable");
+      continue;
+    }
+    downloadedAny = true;
+
+
+
+
+    for (const p of providers) {
+      try {
+        const form = new FormData();
+        const file = audioFileDetails(format.mimeType);
+        form.append(
+          "file",
+          new Blob([audio.slice().buffer as ArrayBuffer], { type: file.mime }),
+          file.name,
+        );
+        form.append("model", p.model);
+        form.append("response_format", "json");
+
+        const response = await fetch(p.url, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${p.key}` },
+          body: form,
+        });
+        if (!response.ok) {
+          const providerError = (await response.text()).slice(0, 500);
+          console.error("[youtube] transcription provider rejected audio", {
+            provider: p.openai ? "openai" : "lovable",
+            status: response.status,
+            error: providerError,
+          });
+          if (p.openai && response.status === 401) lastError = new Error("openai_invalid_key");
+          else if (p.openai && (response.status === 429 || response.status === 402))
+            lastError = new Error("openai_quota");
+          else lastError = new Error("youtube_transcription_failed");
+          continue;
+        }
+
+        const text = (await readTranscriptionResponse(response)).replace(/\s{2,}/g, " ").trim();
+        if (text) return text;
+      } catch (error) {
+        console.error("[youtube] transcription request failed", error);
+        lastError = error instanceof Error ? error : new Error("youtube_transcription_failed");
+      }
+    }
+  }
+  if (!downloadedAny) throw new Error("youtube_audio_unavailable");
+  if (lastError) throw lastError;
+  throw new Error("youtube_transcription_failed");
+}
+
+
+export type YoutubeTranscript = { videoId: string; title: string; text: string };
+
+/** Throws `youtube_invalid_url` or `youtube_no_captions` on failure. */
+export async function fetchYoutubeTranscript(
+  input: string,
+  apiKey?: string,
+): Promise<YoutubeTranscript> {
+  const videoId = parseYoutubeId(input);
+  if (!videoId) throw new Error("youtube_invalid_url");
+
+  let title = "";
+  let tracks: CaptionTrack[] = [];
+
+  try {
+    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=en`, {
+      headers: {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+      },
+    });
+    if (res.ok) {
+      const html = await res.text();
+      const titleMatch =
+        html.match(/<meta\s+name="title"\s+content="([^"]*)"/) ??
+        html.match(/<title>([^<]*)<\/title>/);
+      title = decodeEntities(titleMatch?.[1] ?? "").replace(/\s*-\s*YouTube$/, "").trim();
+      tracks = extractJson<CaptionTrack[]>(html, '"captionTracks"') ?? [];
+    }
+  } catch {
+    /* fall back to innertube */
+  }
+
+  if (tracks.length === 0) {
+    const alt = await fetchInnertube(videoId);
+    if (alt) {
+      tracks = alt.tracks;
+      title = title || alt.title;
+    }
+  }
+
+  // Prefer Arabic, then English, then manual, then anything.
+  const ordered = [
+    tracks.find((tr) => tr.languageCode === "ar" && tr.kind !== "asr"),
+    tracks.find((tr) => tr.languageCode === "ar"),
+    tracks.find((tr) => tr.languageCode?.startsWith("en") && tr.kind !== "asr"),
+    tracks.find((tr) => tr.languageCode?.startsWith("en")),
+    tracks.find((tr) => tr.kind !== "asr"),
+    ...tracks,
+  ].filter((t): t is CaptionTrack => Boolean(t?.baseUrl));
+
+  let text = "";
+  const seen = new Set<string>();
+  for (const track of ordered) {
+    if (seen.has(track.baseUrl)) continue;
+    seen.add(track.baseUrl);
+    text = await fetchTrackText(track.baseUrl);
+    if (text.length >= 40) break;
+  }
+
+  // Last-resort captions: YouTube's public timedtext endpoint (works for some
+  // videos whose caption tracks are missing from the player response).
+  if (text.length < 40) {
+    for (const lang of ["ar", "en"]) {
+      for (const extra of ["", "&kind=asr"]) {
+        text = await fetchTrackText(
+          `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}${extra}`,
+        );
+        if (text.length >= 40) break;
+      }
+      if (text.length >= 40) break;
+    }
+  }
+
+  // No captions at all → transcribe the audio itself. Lovable AI is the
+  // primary provider, so this must run even when no direct OpenAI key exists.
+  if (text.length < 40) {
+    text = await transcribeYoutubeAudio(videoId, apiKey);
+  }
+
+  if (text.length < 40) throw new Error("youtube_no_captions");
+
+  return { videoId, title: title || "YouTube", text: text.slice(0, 40000) };
+}
