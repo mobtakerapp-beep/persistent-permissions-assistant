@@ -365,7 +365,8 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
       continue;
     }
     downloadedAny = true;
-    if (!downloadedAny) continue;
+
+
 
 
     for (const p of providers) {
