@@ -261,3 +261,27 @@ export const adminSetCodeActive = createServerFn({ method: "POST" })
     await supabaseAdmin.from("activation_codes").update({ active: data.active }).eq("id", data.id);
     return { ok: true };
   });
+
+export type OwnerCredentials = { email: string; serial: string };
+
+/**
+ * Fixed owner credentials, resolved from the database (activation_codes) so the
+ * email + serial are always available and never depend on local state that is
+ * lost when the page changes.
+ */
+export const getOwnerCredentials = createServerFn({ method: "GET" }).handler(
+  async (): Promise<OwnerCredentials> => {
+    const fallback: OwnerCredentials = { email: "UUxz272@gmail.com", serial: "UUXZ@272" };
+    try {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data } = await supabaseAdmin
+        .from("activation_codes")
+        .select("code")
+        .eq("code", fallback.serial)
+        .maybeSingle();
+      return { email: fallback.email, serial: data?.code ?? fallback.serial };
+    } catch {
+      return fallback;
+    }
+  },
+);

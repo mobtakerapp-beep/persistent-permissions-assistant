@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label";
 import { Toaster } from "@/components/ui/sonner";
 import { supabase } from "@/integrations/supabase/client";
 
+import { getOwnerCredentials, type OwnerCredentials } from "@/lib/access.functions";
 import { confirmExistingEmail, resetPasswordWithCode, signUpDirect } from "@/lib/auth.functions";
 import { useI18n } from "@/lib/i18n";
 import { saveProfile } from "@/lib/subscription.functions";
@@ -40,6 +41,11 @@ function AuthPage() {
   const confirmEmail = useServerFn(confirmExistingEmail);
   const saveProfileFn = useServerFn(saveProfile);
   const resetPasswordFn = useServerFn(resetPasswordWithCode);
+  const ownerCreds = useServerFn(getOwnerCredentials);
+  const [owner, setOwner] = useState<OwnerCredentials>({
+    email: ADMIN_EMAIL,
+    serial: ADMIN_RECOVERY_CODE,
+  });
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [email, setEmail] = useState("");
   const [remember, setRemember] = useState(true);
@@ -59,14 +65,31 @@ function AuthPage() {
     });
   }, [navigate]);
 
+  // Owner email + serial come from the cloud, so they survive every page
+  // change and are never lost with local state.
+  useEffect(() => {
+    let alive = true;
+    ownerCreds()
+      .then((creds: OwnerCredentials) => {
+        if (!alive) return;
+        setOwner(creds);
+        setEmail((current) => current || localStorage.getItem("remembered_email") || creds.email);
+        setResetCode((current) => current || creds.serial);
+      })
+      .catch(() => {
+        /* keep the built-in defaults */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [ownerCreds]);
+
   // Remembered email (saved locally on the device).
   useEffect(() => {
     const saved = localStorage.getItem("remembered_email");
     if (saved) {
       setEmail(saved);
       setRemember(true);
-    } else {
-      setRemember(false);
     }
   }, []);
 
@@ -78,11 +101,12 @@ function AuthPage() {
   const toggleReset = () => {
     const opening = !showReset;
     setShowReset(opening);
-    if (opening && (!email.trim() || email.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase())) {
-      setEmail(ADMIN_EMAIL);
-      setResetCode(ADMIN_RECOVERY_CODE);
+    if (opening && (!email.trim() || email.trim().toLowerCase() === owner.email.toLowerCase())) {
+      setEmail(owner.email);
+      setResetCode(owner.serial);
     }
   };
+
 
   const resetWithCode = async (e: React.FormEvent) => {
     e.preventDefault();
