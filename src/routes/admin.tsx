@@ -32,6 +32,13 @@ import {
   type CodeRow,
   type RedemptionRow,
 } from "@/lib/access.functions";
+import {
+  createCodesClient,
+  isAdminClient,
+  listCodesClient,
+  listRedemptionsClient,
+  setCodeActiveClient,
+} from "@/lib/admin-client";
 import { useI18n } from "@/lib/i18n";
 
 export const Route = createFileRoute("/admin")({
@@ -88,6 +95,47 @@ function AdminPage() {
   const createCodes = useServerFn(adminCreateCodes);
   const setActive = useServerFn(adminSetCodeActive);
 
+  // The server functions need the service key. When a deployment does not have
+  // it (external hosting), fall back to direct database access using the
+  // signed-in admin's own session, which RLS already allows.
+  const listCodesSafe = async () => {
+    try {
+      return await listCodes({ data: undefined } as never);
+    } catch {
+      return await listCodesClient();
+    }
+  };
+  const listRedemptionsSafe = async () => {
+    try {
+      return await listRedemptions({ data: undefined } as never);
+    } catch {
+      return await listRedemptionsClient();
+    }
+  };
+  const createCodesSafe = async (arg: {
+    data: {
+      count: number;
+      plan: "monthly" | "yearly";
+      durationDays: number;
+      maxUses: number;
+      note?: string;
+      notes?: string[];
+    };
+  }) => {
+    try {
+      return await createCodes(arg);
+    } catch {
+      return await createCodesClient(arg.data);
+    }
+  };
+  const setActiveSafe = async (id: string, active: boolean) => {
+    try {
+      return await setActive({ data: { id, active } });
+    } catch {
+      return await setCodeActiveClient(id, active);
+    }
+  };
+
   const [ready, setReady] = useState(false);
   const [allowed, setAllowed] = useState(false);
   const [rows, setRows] = useState<CodeRow[]>([]);
@@ -107,8 +155,8 @@ function AdminPage() {
 
   const refresh = async () => {
     try {
-      setRows(await listCodes({ data: undefined } as never));
-      setRedemptions(await listRedemptions({ data: undefined } as never));
+      setRows(await listCodesSafe());
+      setRedemptions(await listRedemptionsSafe());
     } catch {
       /* ignore */
     }
@@ -192,12 +240,19 @@ function AdminPage() {
         navigate({ to: "/auth" });
         return;
       }
+      let admin = false;
       try {
         const a = await checkAdmin({ data: undefined } as never);
-        setAllowed(Boolean(a?.isAdmin));
-        if (a?.isAdmin) await refresh();
+        admin = Boolean(a?.isAdmin);
       } catch {
-        setAllowed(false);
+        admin = false;
+      }
+      try {
+        if (!admin) admin = await isAdminClient();
+        setAllowed(admin);
+        if (admin) await refresh();
+      } catch {
+        setAllowed(admin);
       } finally {
         setReady(true);
       }
@@ -209,7 +264,7 @@ function AdminPage() {
     setBusy(true);
     try {
       const perCode = Array.from({ length: count }, (_u, i) => notes[i] ?? "");
-      const res = await createCodes({
+      const res = await createCodesSafe({
         data: { count, plan, durationDays, maxUses, note: note || undefined, notes: perCode },
       });
       toast.success(
@@ -235,7 +290,7 @@ function AdminPage() {
     try {
       const days = which === "monthly" ? 30 : 365;
       const name = waName.trim();
-      const res = await createCodes({
+      const res = await createCodesSafe({
         data: {
           count: 1,
           plan: which,
@@ -267,7 +322,7 @@ function AdminPage() {
       const which: "monthly" | "yearly" = r.plan === "yearly" ? "yearly" : "monthly";
       const days = which === "monthly" ? 30 : 365;
       const label = r.note || r.userEmail || "";
-      const res = await createCodes({
+      const res = await createCodesSafe({
         data: {
           count: 1,
           plan: which,
@@ -291,7 +346,7 @@ function AdminPage() {
   };
 
   const toggle = async (row: CodeRow) => {
-    await setActive({ data: { id: row.id, active: !row.active } });
+    await setActiveSafe(row.id, !row.active);
     await refresh();
   };
 
