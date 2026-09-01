@@ -27,14 +27,40 @@ function getClaimEmail(claims: unknown) {
   return typeof email === "string" ? email : undefined;
 }
 
-async function assertAdmin(userId: string, email?: unknown) {
+type UserScopedClient = {
+  rpc: (fn: string, args: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+};
+
+/** Checks the admin role using the caller's own session (no service key needed). */
+async function hasAdminRole(supabase: unknown, userId: string) {
+  try {
+    const client = supabase as UserScopedClient | undefined;
+    if (client?.rpc) {
+      const { data, error } = await client.rpc("has_role", {
+        _user_id: userId,
+        _role: "admin",
+      });
+      if (!error && data) return true;
+      if (!error) return false;
+    }
+  } catch {
+    // fall through to the service client
+  }
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await supabaseAdmin.rpc("has_role", {
+      _user_id: userId,
+      _role: "admin",
+    });
+    return Boolean(data);
+  } catch {
+    return false;
+  }
+}
+
+async function assertAdmin(userId: string, email?: unknown, supabase?: unknown) {
   if (isConfiguredAdminEmail(email)) return;
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data, error } = await supabaseAdmin.rpc("has_role", {
-    _user_id: userId,
-    _role: "admin",
-  });
-  if (error || !data) throw new Error("Forbidden");
+  if (!(await hasAdminRole(supabase, userId))) throw new Error("Forbidden");
 }
 
 export const amIAdmin = createServerFn({ method: "GET" })
@@ -43,13 +69,9 @@ export const amIAdmin = createServerFn({ method: "GET" })
     if (isConfiguredAdminEmail(getClaimEmail(context.claims))) {
       return { isAdmin: true };
     }
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data } = await supabaseAdmin.rpc("has_role", {
-      _user_id: context.userId,
-      _role: "admin",
-    });
-    return { isAdmin: Boolean(data) };
+    return { isAdmin: await hasAdminRole(context.supabase, context.userId) };
   });
+
 
 /** Redeem an activation code — binds the subscription to the signed-in account. */
 export const redeemCode = createServerFn({ method: "POST" })
@@ -128,7 +150,7 @@ export const redeemCode = createServerFn({ method: "POST" })
 export const adminListCodes = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }): Promise<CodeRow[]> => {
-    await assertAdmin(context.userId, getClaimEmail(context.claims));
+    await assertAdmin(context.userId, getClaimEmail(context.claims), context.supabase);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data } = await supabaseAdmin
       .from("activation_codes")
@@ -163,7 +185,7 @@ export const adminCreateCodes = createServerFn({ method: "POST" })
       .parse(input),
   )
   .handler(async ({ data, context }) => {
-    await assertAdmin(context.userId, getClaimEmail(context.claims));
+    await assertAdmin(context.userId, getClaimEmail(context.claims), context.supabase);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     const gen = () => {
@@ -203,7 +225,7 @@ export type RedemptionRow = {
 export const adminListRedemptions = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }): Promise<RedemptionRow[]> => {
-    await assertAdmin(context.userId, getClaimEmail(context.claims));
+    await assertAdmin(context.userId, getClaimEmail(context.claims), context.supabase);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
     const { data: redemptions } = await supabaseAdmin
@@ -256,7 +278,7 @@ export const adminSetCodeActive = createServerFn({ method: "POST" })
     z.object({ id: z.string().uuid(), active: z.boolean() }).parse(input),
   )
   .handler(async ({ data, context }) => {
-    await assertAdmin(context.userId, getClaimEmail(context.claims));
+    await assertAdmin(context.userId, getClaimEmail(context.claims), context.supabase);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     await supabaseAdmin.from("activation_codes").update({ active: data.active }).eq("id", data.id);
     return { ok: true };
