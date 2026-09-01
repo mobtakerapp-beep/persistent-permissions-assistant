@@ -29,15 +29,26 @@ export async function getSubscriptionStatus(
   supabase: SupabaseClient,
   userId: string,
 ): Promise<SubscriptionStatus> {
-  const [subResult, profileResult, userResult] = await Promise.all([
+  let [subResult, profileResult, userResult] = await Promise.all([
     supabase.from("subscriptions").select("*").eq("user_id", userId).maybeSingle(),
     supabase.from("profiles").select("*").eq("id", userId).maybeSingle(),
     supabase.auth.getUser(),
   ]);
 
+  // Self-healing: creates the missing profile/subscription rows and restores
+  // the owner account's admin role + premium plan after any data move.
+  if (!subResult.data || !profileResult.data) {
+    await supabase.rpc("bootstrap_account", { _user_id: userId });
+    [subResult, profileResult] = await Promise.all([
+      supabase.from("subscriptions").select("*").eq("user_id", userId).maybeSingle(),
+      supabase.from("profiles").select("*").eq("id", userId).maybeSingle(),
+    ]);
+  }
+
   const sub = subResult.data;
   const profile = profileResult.data;
   const email = userResult.data?.user?.email ?? "";
+
 
   const now = new Date();
   let plan: "free" | "monthly" | "yearly" = "free";
