@@ -47,11 +47,21 @@ export const signUpDirect = createServerFn({ method: "POST" })
         },
       }));
       const newId = created?.user?.id;
-      if (!error && newId && ADMIN_EMAILS.includes(data.email.trim().toLowerCase())) {
-        await supabaseAdmin
-          .from("user_roles")
-          .insert({ user_id: newId, role: "admin" });
+      if (!error && newId) {
+        // Creates the profile + free subscription and, for the fixed owner
+        // account, re-binds the admin role, the serial and premium access.
+        await supabaseAdmin.rpc("bootstrap_account", {
+          _user_id: newId,
+          _teacher_name: data.teacherName,
+          _school: data.school,
+        });
+        if (ADMIN_EMAILS.includes(data.email.trim().toLowerCase())) {
+          await supabaseAdmin
+            .from("user_roles")
+            .upsert({ user_id: newId, role: "admin" }, { onConflict: "user_id,role" });
+        }
       }
+
     } catch (e) {
       console.error("[signUpDirect] admin call failed", e);
       return {
