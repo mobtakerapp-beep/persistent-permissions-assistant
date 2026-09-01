@@ -344,19 +344,18 @@ export async function transcribeYoutubeAudio(videoId: string, apiKey?: string): 
   let downloadedAny = false;
 
   /** Downloads one audio file; retries with a range request when YouTube 403s. */
-  const downloadAudio = async (format: AudioFormat): Promise<Uint8Array | null> => {
+  const downloadAudio = async (format: AudioFormat & { ua: string }): Promise<Uint8Array | null> => {
     const size = Number(format.contentLength ?? 0);
     const attempts: HeadersInit[] = [
-      { "User-Agent": UA },
       // Range requests are what the real player sends; googlevideo often
       // rejects a plain full-file GET with 403 but honours this one.
       {
-        "User-Agent": UA,
+        "User-Agent": format.ua,
         Range: `bytes=0-${Math.max(0, Math.min(size, WHISPER_MAX_BYTES) - 1)}`,
-        Origin: "https://www.youtube.com",
-        Referer: "https://www.youtube.com/",
       },
+      { "User-Agent": format.ua },
     ];
+
     for (const headers of attempts) {
       try {
         const res = await fetch(format.url ?? "", { headers });
